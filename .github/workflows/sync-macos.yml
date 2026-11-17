@@ -1,0 +1,128 @@
+name: Sync macOS Release
+
+on:
+  schedule:
+    - cron: '17 */4 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Upstream release tag to build (defaults to latest)
+        required: false
+        type: string
+      force:
+        description: Rebuild even if this tag already has a macOS update manifest
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-macos-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      should_build: ${{ steps.resolve.outputs.should_build }}
+    steps:
+      - name: Check upstream latest release
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          if [ -n "$INPUT_TAG" ]; then
+            tag="$INPUT_TAG"
+          else
+            tag=$(gh api repos/nya-owo/cloudy/releases/latest --jq .tag_name)
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+          gh release view "$tag" --repo nya-owo/cloudy --json tagName >/dev/null
+
+          if [ "$FORCE" = "true" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          has_manifest=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
+            --json isDraft,assets \
+            --jq 'if .isDraft then false else ([.assets[].name] | index("update-darwin-arm64.json") != null) end' \
+            2>/dev/null || echo "false")
+
+          if [ "$has_manifest" = "true" ]; then
+            echo "Release $tag already has update-darwin-arm64.json"
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: macos-latest
+    steps:
+      - name: Checkout upstream tag
+        uses: actions/checkout@v7
+        with:
+          repository: nya-owo/cloudy
+          ref: ${{ needs.check.outputs.tag }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Configure fork updates in mygo.json
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
+          UPDATER_PUBLIC_KEY: cx3oSYMGG0PYcTqlnKgQGuh2m386YBV/WHDyR0qZm4s=
+        run: |
+          set -euo pipefail
+          test "$TAG" = "v$(jq -r .version mygo.json)"
+          jq --arg repo "$GITHUB_REPOSITORY" --arg pub "$UPDATER_PUBLIC_KEY" \
+            '.updates.github = $repo | .updates.publicKey = $pub' \
+            mygo.json > mygo.json.tmp
+          mv mygo.json.tmp mygo.json
+
+      - name: Extract release notes from CHANGELOG.md
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          awk -v heading="## ${TAG#v}" '
+            /^## / { inside = ($0 == heading); next }
+            inside
+          ' CHANGELOG.md | sed '/./,$!d' > "$RUNNER_TEMP/notes.md"
+          if [ ! -s "$RUNNER_TEMP/notes.md" ]; then
+            gh release view "$TAG" --repo nya-owo/cloudy --json body --jq .body > "$RUNNER_TEMP/notes.md"
+          fi
+          cat "$RUNNER_TEMP/notes.md"
+
+      - name: Build and upload macOS app
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MYGO_UPDATER_PRIVATE_KEY: ${{ secrets.MYGO_UPDATER_PRIVATE_KEY }}
+        run: go tool mygo build -platform darwin/arm64 -upload
+
+      - name: Remove Linux-only install script and publish release
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release delete-asset "$TAG" install.sh --repo "$GITHUB_REPOSITORY" --yes || true
+          latest_upstream=$(gh api repos/nya-owo/cloudy/releases/latest --jq .tag_name)
+          latest_flag=""
+          if [ "$TAG" = "$latest_upstream" ]; then
+            latest_flag="--latest"
+          fi
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --draft=false $latest_flag --notes-file "$RUNNER_TEMP/notes.md"
