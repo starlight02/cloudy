@@ -91,6 +91,32 @@ jobs:
             mygo.json > mygo.json.tmp
           mv mygo.json.tmp mygo.json
 
+      - name: Use private session file for adhoc-signed macOS builds
+        run: |
+          set -euo pipefail
+          if git grep -n 'mygo\.Secrets' -- '*.go' ':!internal/netease/auth.go'; then
+            echo "unexpected mygo.Secrets usage outside internal/netease/auth.go" >&2
+            exit 1
+          fi
+          awk '
+            /^func (read|write|delete)Session\(/ { in_session = 1 }
+            in_session && /^[[:space:]]*if !mygo\.IsDev\(\) \{$/ {
+              sub(/!mygo\.IsDev\(\)/, "false")
+              count++
+            }
+            /^}$/ { in_session = 0 }
+            { print }
+            END {
+              if (count != 3) {
+                print "expected 3 !mygo.IsDev() guards in session helpers of internal/netease/auth.go, got " count > "/dev/stderr"
+                exit 1
+              }
+            }
+          ' internal/netease/auth.go > internal/netease/auth.go.tmp
+          mv internal/netease/auth.go.tmp internal/netease/auth.go
+          go vet ./internal/netease/...
+          go test ./internal/netease/...
+
       - name: Extract release notes from CHANGELOG.md
         env:
           TAG: ${{ needs.check.outputs.tag }}
